@@ -1,5 +1,5 @@
-identifier: nrf5340dk/nrf5340/cpuapp
-name: NRF5340-DK-NRF5340-application-MCU
+identifier: gms_eeg_cpuapp
+name: gms_eeg-application-MCU
 type: mcu
 arch: arm
 toolchain:

@@ -1,5 +1,5 @@
-identifier: nrf5340dk/nrf5340/cpunet
-name: NRF5340-DK-NRF5340-network-MCU
+identifier: gms_eeg_cpunet
+name: gms_eeg-network-MCU
 type: mcu
 arch: arm
 toolchain:
