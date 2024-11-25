@@ -6,7 +6,7 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 set(BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-set(BOARD gms_eeg_cpuapp)
+set(BOARD gms_nrf5340_cpuapp)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(NONE)

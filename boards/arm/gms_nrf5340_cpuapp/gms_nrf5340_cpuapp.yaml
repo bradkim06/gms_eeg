@@ -1,11 +1,11 @@
-identifier: gms_eeg_cpuapp
-name: gms_eeg-application-MCU
+identifier: gms_nrf5340_cpuapp
+name: GMS-NRF5340-APP
 type: mcu
 arch: arm
 toolchain:
+  - zephyr
   - gnuarmemb
   - xtools
-  - zephyr
 ram: 448
 flash: 1024
 supported:
@@ -15,8 +15,6 @@ supported:
   - pwm
   - watchdog
   - usb_device
-  - usbd
+  - usb_cdc
+  - arm_trustzone_m
   - netif:openthread
-  - gpio
-  - spi
-vendor: nordic
