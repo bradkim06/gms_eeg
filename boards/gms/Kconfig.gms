@@ -1,0 +1,9 @@
+# Raytac MDBT53-DB-40 NRF5340 board configuration
+
+# Copyright (c) 2019-2020 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_GMS
+	select SOC_NRF5340_CPUAPP_QKAA if BOARD_GMS_NRF5340_CPUAPP
+	select SOC_NRF5340_CPUAPP_QKAA if BOARD_GMS_NRF5340_CPUAPP_NS
+	select SOC_NRF5340_CPUNET_QKAA if BOARD_GMS_NRF5340_CPUNET

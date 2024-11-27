@@ -1,20 +1,20 @@
-identifier: gms_nrf5340_cpuapp
-name: GMS-NRF5340-APP
+identifier: raytac_mdbt53v_db_40/nrf5340/cpuapp
+name: RAYTAC-MDBT53V-DB-40-NRF5340-application-MCU
 type: mcu
 arch: arm
 toolchain:
-  - zephyr
   - gnuarmemb
   - xtools
+  - zephyr
 ram: 448
 flash: 1024
 supported:
+  - counter
   - gpio
   - i2c
   - i2s
   - pwm
+  - qspi
+  - spi
   - watchdog
-  - usb_device
-  - usb_cdc
-  - arm_trustzone_m
   - netif:openthread
