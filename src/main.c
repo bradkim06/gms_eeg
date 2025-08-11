@@ -52,6 +52,13 @@ static K_SEM_DEFINE(ble_init_ok, 0, 1);
 static struct bt_conn *current_conn;
 static struct bt_conn *auth_conn;
 
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+                            struct bt_gatt_exchange_params *params);
+
+static struct bt_gatt_exchange_params exchange_params = {
+    .func = mtu_exchange_cb,
+};
+
 static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
 /* STEP 6.2 - Declare the struct of the data item of the FIFOs */
@@ -321,6 +328,16 @@ static int uart_init(void) {
     return err;
 }
 
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+                            struct bt_gatt_exchange_params *params)
+{
+    if (err) {
+        LOG_ERR("MTU exchange failed (err 0x%02x)", err);
+    } else {
+        LOG_INF("MTU exchanged: %u", bt_gatt_get_mtu(conn));
+    }
+}
+
 static void connected(struct bt_conn *conn, uint8_t err) {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -334,6 +351,8 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     LOG_INF("Connected %s", addr);
 
     current_conn = bt_conn_ref(conn);
+
+    bt_gatt_exchange_mtu(current_conn, &exchange_params);
 
     dk_set_led_on(CON_STATUS_LED);
 }
