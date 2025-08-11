@@ -631,7 +631,10 @@ void ble_write_thread(void) {
             if (nus_data.len >= sizeof(nus_data.data) ||
                 (nus_data.data[nus_data.len - 1] == '\n') ||
                 (nus_data.data[nus_data.len - 1] == '\r')) {
-                if (bt_nus_send(NULL, nus_data.data, nus_data.len)) {
+                if (!current_conn) {
+                    LOG_WRN("No active BLE connection; dropping data");
+                } else if (bt_nus_send(current_conn, nus_data.data,
+                                       nus_data.len)) {
                     LOG_WRN("Failed to send data over BLE connection");
                 }
                 nus_data.len = 0;
