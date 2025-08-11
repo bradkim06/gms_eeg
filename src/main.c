@@ -498,11 +498,8 @@ static struct bt_nus_cb nus_cb = {
 
 void error(void) {
     dk_set_leds_state(DK_ALL_LEDS_MSK, DK_NO_LEDS_MSK);
-
-    while (true) {
-        /* Spin for ever */
-        k_sleep(K_MSEC(1000));
-    }
+    LOG_ERR("Fatal error encountered, system will panic");
+    k_panic();
 }
 
 #ifdef CONFIG_BT_NUS_SECURITY_ENABLED
