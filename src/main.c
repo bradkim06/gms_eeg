@@ -51,11 +51,6 @@ static struct {
     enum { RS_SYNC0, RS_SYNC1, RS_VER, RS_PAYLOAD } st;
 } hhs_rx = {.st = RS_SYNC0};
 
-/* Representing a connection to a remote device (kernel API). */
-struct bt_conn *my_conn = NULL;
-/* Variable for not transmitting if the MTU size is not negotiated. */
-static uint16_t mtu_size = 27;
-
 /*
  * Function: update_data_length
  * Description: This function updates the data length of the given connection.
@@ -72,7 +67,7 @@ static void update_data_length(struct bt_conn *conn) {
     };
 
     /* Update the data length of the connection */
-    err = bt_conn_le_data_len_update(my_conn, &my_data_len);
+    err = bt_conn_le_data_len_update(conn, &my_data_len);
 
     /* Check for errors */
     if (err) {
@@ -91,7 +86,6 @@ static void exchange_func(struct bt_conn *conn, uint8_t att_err,
         uint16_t payload_mtu =
             bt_gatt_get_mtu(conn) - 3; // 3 bytes used for Attribute headers.
         LOG_INF("New MTU: %d bytes", payload_mtu);
-        mtu_size = payload_mtu;
     }
 }
 
@@ -416,12 +410,12 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     }
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     LOG_INF("Connected %s", addr);
-    my_conn = bt_conn_ref(conn);
+    current_conn = bt_conn_ref(conn);
     dk_set_led_on(CON_STATUS_LED);
 
     // Update the data length and MTU
-    update_data_length(my_conn);
-    update_mtu(my_conn);
+    update_data_length(conn);
+    update_mtu(conn);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason) {
@@ -430,11 +424,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     LOG_INF("Disconnected: %s, reason 0x%02x %s", addr, reason,
             bt_hci_err_to_str(reason));
 
-    if (current_conn) {
-        bt_conn_unref(current_conn);
-        current_conn = NULL;
-        dk_set_led_off(CON_STATUS_LED);
+    if (current_conn != conn) {
+        return;
     }
+
+    bt_conn_unref(current_conn);
+    current_conn = NULL;
+    dk_set_led_off(CON_STATUS_LED);
+
     /* 끊길 때 남은 누적 버퍼 폐기 */
     g_acc_len = 0;
 }
