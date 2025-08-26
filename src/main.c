@@ -51,6 +51,77 @@ static struct {
     enum { RS_SYNC0, RS_SYNC1, RS_VER, RS_PAYLOAD } st;
 } hhs_rx = {.st = RS_SYNC0};
 
+/* Representing a connection to a remote device (kernel API). */
+struct bt_conn *my_conn = NULL;
+/* Variable for not transmitting if the MTU size is not negotiated. */
+static uint16_t mtu_size = 27;
+
+/*
+ * Function: update_data_length
+ * Description: This function updates the data length of the given connection.
+ * Parameters:
+ * 		conn - pointer to the connection to be updated
+ * Return: None
+ */
+static void update_data_length(struct bt_conn *conn) {
+    int err;
+    /* Define the data length parameters */
+    struct bt_conn_le_data_len_param my_data_len = {
+        .tx_max_len = BT_GAP_DATA_LEN_MAX,
+        .tx_max_time = BT_GAP_DATA_TIME_MAX,
+    };
+
+    /* Update the data length of the connection */
+    err = bt_conn_le_data_len_update(my_conn, &my_data_len);
+
+    /* Check for errors */
+    if (err) {
+        LOG_ERR("data_len_update failed (err %d)", err);
+    }
+}
+
+/* Implement callback function for MTU exchange */
+static void exchange_func(struct bt_conn *conn, uint8_t att_err,
+                          struct bt_gatt_exchange_params *params) {
+    // Log the result of the MTU exchange
+    LOG_INF("MTU exchange %s", att_err == 0 ? "successful" : "failed");
+
+    // If the exchange was successful, update the MTU size
+    if (!att_err) {
+        uint16_t payload_mtu =
+            bt_gatt_get_mtu(conn) - 3; // 3 bytes used for Attribute headers.
+        LOG_INF("New MTU: %d bytes", payload_mtu);
+        mtu_size = payload_mtu;
+    }
+}
+
+/**
+ * @brief Update the Maximum Transmission Unit (MTU) for the Bluetooth
+ * connection.
+ *
+ * This function initiates an MTU exchange with a Bluetooth connection. It sets
+ * up the callback function for handling MTU negotiation. If the exchange fails,
+ * it logs an error message.
+ *
+ * @param conn The Bluetooth connection to update the MTU for.
+ */
+static void update_mtu(struct bt_conn *conn) {
+    /* Create variable that holds callback for MTU negotiation */
+    static struct bt_gatt_exchange_params exchange_params;
+
+    /* Set the callback function for handling MTU negotiation */
+    exchange_params.func = exchange_func;
+
+    /* Initiate MTU exchange with the given Bluetooth connection */
+    int err = bt_gatt_exchange_mtu(conn, &exchange_params);
+
+    /* Check if the exchange was successful */
+    if (err) {
+        /* Log an error message if the exchange failed */
+        LOG_ERR("bt_gatt_exchange_mtu failed (err %d)", err);
+    }
+}
+
 typedef void (*hhs_on_frame_t)(const uint8_t *p);
 static inline void hhs_feed(uint8_t c, hhs_on_frame_t on_frame) {
     switch (hhs_rx.st) {
@@ -345,8 +416,12 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     }
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     LOG_INF("Connected %s", addr);
-    current_conn = bt_conn_ref(conn);
+    my_conn = bt_conn_ref(conn);
     dk_set_led_on(CON_STATUS_LED);
+
+    // Update the data length and MTU
+    update_data_length(my_conn);
+    update_mtu(my_conn);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason) {
@@ -409,8 +484,8 @@ int main(void) {
         return 0;
     }
 
-    err =
-        bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
+                          ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising start err %d", err);
         return 0;
