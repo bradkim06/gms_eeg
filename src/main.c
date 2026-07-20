@@ -1,10 +1,9 @@
 /*
- * Nordic NUS + UART + HHS parser
+ * HHS BLE bridge (custom GATT service) + UART + HHS parser
  * - UART 스트림에서 HHS 17바이트 프레임 조립
- * - BLE NUS로 MTU-3 크기 청크로 전송
+ * - HHS 서비스(FFF0)의 Notify 특성(FFF1)으로 MTU-3 크기 청크로 전송
  */
 
-#include <bluetooth/services/nus.h>
 #include <dk_buttons_and_leds.h>
 #include <soc.h>
 #include <stdint.h>
@@ -151,6 +150,54 @@ static inline void hhs_feed(uint8_t c, hhs_on_frame_t on_frame) {
     }
 }
 
+/* --- HHS GATT service --- */
+
+/** @brief HHS Service UUID. */
+#define BT_UUID_HHS_VAL                                                        \
+    BT_UUID_128_ENCODE(0x0000FFF0, 0x0000, 0x1000, 0x8000, 0x00805F9B34FB)
+/** @brief Notify Characteristic UUID. */
+#define BT_UUID_HHS_NOTI_VAL                                                   \
+    BT_UUID_128_ENCODE(0x0000FFF1, 0x0000, 0x1000, 0x8000, 0x00805F9B34FB)
+/** @brief Write Characteristic UUID. */
+#define BT_UUID_HHS_WRITE_VAL                                                  \
+    BT_UUID_128_ENCODE(0x0000FFF2, 0x0000, 0x1000, 0x8000, 0x00805F9B34FB)
+
+#define BT_UUID_HHS BT_UUID_DECLARE_128(BT_UUID_HHS_VAL)
+#define BT_UUID_HHS_NOTI BT_UUID_DECLARE_128(BT_UUID_HHS_NOTI_VAL)
+#define BT_UUID_HHS_WRITE BT_UUID_DECLARE_128(BT_UUID_HHS_WRITE_VAL)
+
+static void hhs_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
+    ARG_UNUSED(attr);
+    LOG_INF("HHS notifications %s",
+            value == BT_GATT_CCC_NOTIFY ? "enabled" : "disabled");
+}
+
+/* Write 특성: 현재 수신 데이터는 사용하지 않음 */
+static ssize_t hhs_write_cb(struct bt_conn *conn,
+                            const struct bt_gatt_attr *attr, const void *buf,
+                            uint16_t len, uint16_t offset, uint8_t flags) {
+    ARG_UNUSED(conn);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(offset);
+    ARG_UNUSED(flags);
+    LOG_HEXDUMP_DBG(buf, len, "HHS write");
+    return len;
+}
+
+BT_GATT_SERVICE_DEFINE(
+    hhs_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_HHS),
+    BT_GATT_CHARACTERISTIC(BT_UUID_HHS_NOTI, BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_NONE, NULL, NULL, NULL),
+    BT_GATT_CCC(hhs_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(BT_UUID_HHS_WRITE,
+                           BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+                           BT_GATT_PERM_WRITE, NULL, hhs_write_cb, NULL));
+
+/* attrs[2] = Notify 특성 값(FFF1). 구독한 모든 연결로 notify */
+static int hhs_send(const uint8_t *data, uint16_t len) {
+    return bt_gatt_notify(NULL, &hhs_svc.attrs[2], data, len);
+}
+
 /* --- BLE / UART glue --- */
 
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
@@ -172,7 +219,7 @@ static const struct bt_data ad[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 static const struct bt_data sd[] = {
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL)};
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_HHS_VAL)};
 
 #ifdef CONFIG_UART_ASYNC_ADAPTER
 UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
@@ -204,13 +251,13 @@ static void nus_flush(uint8_t *acc, size_t *len) {
         size_t chunk = MIN(maxp, *len - off);
         int ret;
         do {
-            ret = bt_nus_send(NULL, &acc[off], chunk);
+            ret = hhs_send(&acc[off], chunk);
             if (ret == -ENOMEM)
                 k_sleep(K_MSEC(5));
         } while (ret == -ENOMEM);
 
         if (ret) { /* 다른 에러면 남은 건 버림 */
-            LOG_WRN("bt_nus_send err=%d", ret);
+            LOG_WRN("hhs_send err=%d", ret);
             break;
         }
         off += chunk;
@@ -377,7 +424,7 @@ static int uart_init(void) {
         return -ENOMEM;
     }
 
-    pos = snprintf(tx->data, sizeof(tx->data), "Starting NUS + HHS parser\r\n");
+    pos = snprintf(tx->data, sizeof(tx->data), "Starting HHS parser\r\n");
     if ((pos < 0) || (pos >= sizeof(tx->data))) {
         k_free(rx);
         k_free(tx);
@@ -441,9 +488,6 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = disconnected,
 };
 
-/* NUS 콜백: 현재는 수신 기능 불필요 */
-static struct bt_nus_cb nus_cb;
-
 void error(void) {
     dk_set_leds_state(DK_ALL_LEDS_MSK, DK_NO_LEDS_MSK);
     while (true) {
@@ -474,12 +518,6 @@ int main(void) {
 
     if (IS_ENABLED(CONFIG_SETTINGS))
         settings_load();
-
-    err = bt_nus_init(&nus_cb);
-    if (err) {
-        LOG_ERR("bt_nus_init err %d", err);
-        return 0;
-    }
 
     err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
                           ARRAY_SIZE(sd));
