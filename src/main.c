@@ -1,7 +1,8 @@
 /*
  * HHS BLE bridge (custom GATT service) + UART + HHS parser
  * - UART 스트림에서 HHS 17바이트 프레임 조립
- * - HHS 서비스(FFF0)의 Notify 특성(FFF1)으로 MTU-3 크기 청크로 전송
+ *   (헤더 0xA5 0x5A 0x02, 끝 byte Switches 0x04|0x05)
+ * - 프레임 완성 즉시 HHS Notify 특성(FFF1)으로 1프레임 = 1 notification 전송
  */
 
 #include <dk_buttons_and_leds.h>
@@ -49,6 +50,19 @@ static struct {
     uint8_t pos;
     enum { RS_SYNC0, RS_SYNC1, RS_VER, RS_PAYLOAD } st;
 } hhs_rx = {.st = RS_SYNC0};
+
+/* 연결 즉시 짧은 연결 간격(7.5~15ms) 요청.
+ * BT_GAP_AUTO_UPDATE_CONN_PARAMS의 5초 대기 없이 바로 협상 시도하고,
+ * 거절되면 5초 뒤 stack의 auto-update가 같은 선호값으로 재시도한다. */
+static void update_conn_params(struct bt_conn *conn) {
+    int err = bt_conn_le_param_update(
+        conn, BT_LE_CONN_PARAM(CONFIG_BT_PERIPHERAL_PREF_MIN_INT,
+                               CONFIG_BT_PERIPHERAL_PREF_MAX_INT,
+                               CONFIG_BT_PERIPHERAL_PREF_LATENCY,
+                               CONFIG_BT_PERIPHERAL_PREF_TIMEOUT));
+    if (err)
+        LOG_WRN("conn param update req failed (err %d)", err);
+}
 
 /*
  * Function: update_data_length
@@ -119,31 +133,37 @@ typedef void (*hhs_on_frame_t)(const uint8_t *p);
 static inline void hhs_feed(uint8_t c, hhs_on_frame_t on_frame) {
     switch (hhs_rx.st) {
     case RS_SYNC0:
-        if (c == 0xA5) {
-            hhs_rx.buf[0] = c;
+        if (c == 0xA5)
             hhs_rx.st = RS_SYNC1;
-        }
         break;
     case RS_SYNC1:
-        if (c == 0x5A) {
-            hhs_rx.buf[1] = c;
+        if (c == 0x5A)
             hhs_rx.st = RS_VER;
-        } else
+        else if (c != 0xA5) /* 0xA5면 새 헤더 시작 후보로 SYNC1 유지 */
             hhs_rx.st = RS_SYNC0;
         break;
     case RS_VER:
         if (c == 0x02) {
+            hhs_rx.buf[0] = 0xA5;
+            hhs_rx.buf[1] = 0x5A;
             hhs_rx.buf[2] = c;
             hhs_rx.pos = 3;
             hhs_rx.st = RS_PAYLOAD;
-        } else
-            hhs_rx.st = RS_SYNC0;
+        } else {
+            hhs_rx.st = (c == 0xA5) ? RS_SYNC1 : RS_SYNC0;
+        }
         break;
     case RS_PAYLOAD:
         hhs_rx.buf[hhs_rx.pos++] = c;
         if (hhs_rx.pos >= HHS_PKT_SIZE) {
-            if (on_frame)
-                on_frame(hhs_rx.buf);
+            /* Switches byte: 0x04(No Wear) / 0x05(Wear)만 유효한 프레임 */
+            uint8_t sw = hhs_rx.buf[HHS_PKT_SIZE - 1];
+            if (sw == 0x04 || sw == 0x05) {
+                if (on_frame)
+                    on_frame(hhs_rx.buf);
+            } else {
+                LOG_WRN("frame dropped: bad switches 0x%02x", sw);
+            }
             hhs_rx.st = RS_SYNC0;
         }
         break;
@@ -227,61 +247,19 @@ UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
 #define async_adapter NULL
 #endif
 
-/* 누적 버퍼(ATT MTU-3 기준으로 채워서 전송) */
-static uint8_t g_acc[UART_BUF_SIZE];
-static size_t g_acc_len;
-
-static size_t nus_max_payload(void) {
-    uint16_t mtu = current_conn ? bt_gatt_get_mtu(current_conn) : 23;
-    if (mtu < 23)
-        mtu = 23;
-    size_t max_payload = mtu - 3; /* ATT Notification header */
-    if (max_payload > sizeof(g_acc))
-        max_payload = sizeof(g_acc);
-    return max_payload;
-}
-
-/* 1) MTU-3로 쪼개 전송하도록 nus_flush 교체 */
-static void nus_flush(uint8_t *acc, size_t *len) {
-    if (!*len)
-        return;
-    size_t off = 0, maxp = nus_max_payload();
-
-    while (off < *len) {
-        size_t chunk = MIN(maxp, *len - off);
-        int ret;
-        do {
-            ret = hhs_send(&acc[off], chunk);
-            if (ret == -ENOMEM)
-                k_sleep(K_MSEC(5));
-        } while (ret == -ENOMEM);
-
-        if (ret) { /* 다른 에러면 남은 건 버림 */
-            LOG_WRN("hhs_send err=%d", ret);
-            break;
-        }
-        off += chunk;
-    }
-    *len = 0;
-}
-
-/* 2) 프레임 그대로 누적하도록 on_hhs_frame_cb 교체 */
+/* 프레임 완성 즉시 notify. 17B는 최소 ATT MTU(23)-3 안에 항상 들어가므로
+ * 1프레임 = 1 notification이 보장된다. */
 static void on_hhs_frame_cb(const uint8_t *p) {
-    size_t maxp = nus_max_payload();
+    int ret;
 
-    /* 누적 버퍼 부족 시 먼저 플러시 */
-    if (g_acc_len + HHS_PKT_SIZE > sizeof(g_acc)) {
-        nus_flush(g_acc, &g_acc_len);
-    }
+    do {
+        ret = hhs_send(p, HHS_PKT_SIZE);
+        if (ret == -ENOMEM) /* TX 버퍼 고갈: 잠시 대기 후 재시도 */
+            k_sleep(K_MSEC(5));
+    } while (ret == -ENOMEM);
 
-    /* 17바이트 프레임 그대로 붙임 */
-    memcpy(&g_acc[g_acc_len], p, HHS_PKT_SIZE);
-    g_acc_len += HHS_PKT_SIZE;
-
-    /* 가득 찼으면 즉시 송신 */
-    if (g_acc_len >= maxp) {
-        nus_flush(g_acc, &g_acc_len);
-    }
+    if (ret && ret != -ENOTCONN) /* 미연결/미구독 시엔 조용히 폐기 */
+        LOG_WRN("hhs_send err=%d", ret);
 }
 
 /* UART 콜백: 라인 종료 문자를 기준으로 끊지 않음. 버퍼 교체 이벤트로만 큐잉 */
@@ -306,10 +284,19 @@ static void uart_cb(const struct device *dev, struct uart_event *evt,
         k_free(buf);
         break;
 
-    case UART_RX_RDY:
-        buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data[0]);
-        buf->len += evt->data.rx.len;
+    case UART_RX_RDY: {
+        /* 수신분을 즉시 복사해 큐잉: 드라이버 버퍼가 가득 차길 기다리지
+         * 않으므로(타임아웃 단위로 이벤트 발생) 패킷 지연이 없다 */
+        struct uart_data_t *chunk = k_malloc(sizeof(*chunk));
+        if (!chunk) {
+            LOG_WRN("RX_RDY: alloc fail, %d bytes dropped", evt->data.rx.len);
+            break;
+        }
+        chunk->len = MIN(evt->data.rx.len, sizeof(chunk->data));
+        memcpy(chunk->data, &evt->data.rx.buf[evt->data.rx.offset], chunk->len);
+        k_fifo_put(&fifo_uart_rx_data, chunk);
         break;
+    }
 
     case UART_RX_DISABLED: {
         buf = k_malloc(sizeof(*buf));
@@ -318,15 +305,18 @@ static void uart_cb(const struct device *dev, struct uart_event *evt,
             k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
             return;
         }
-        buf->len = 0;
-        uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+        if (uart_rx_enable(uart, buf->data, sizeof(buf->data),
+                           UART_WAIT_FOR_RX)) {
+            LOG_WRN("RX_DISABLED: rx_enable fail");
+            k_free(buf);
+            k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+        }
         break;
     }
 
     case UART_RX_BUF_REQUEST:
         buf = k_malloc(sizeof(*buf));
         if (buf) {
-            buf->len = 0;
             uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
         } else {
             LOG_WRN("RX_BUF_REQUEST: alloc fail");
@@ -334,12 +324,9 @@ static void uart_cb(const struct device *dev, struct uart_event *evt,
         break;
 
     case UART_RX_BUF_RELEASED:
+        /* 데이터는 RX_RDY에서 이미 큐잉됨. 컨테이너만 반납 */
         buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t, data[0]);
-        if (buf->len > 0) {
-            k_fifo_put(&fifo_uart_rx_data, buf);
-        } else {
-            k_free(buf);
-        }
+        k_free(buf);
         break;
 
     case UART_TX_ABORTED:
@@ -363,8 +350,11 @@ static void uart_work_handler(struct k_work *item) {
         k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
         return;
     }
-    buf->len = 0;
-    uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+    if (uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX)) {
+        LOG_WRN("uart_work: rx_enable fail");
+        k_free(buf);
+        k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+    }
 }
 
 static bool uart_test_async_api(const struct device *dev) {
@@ -460,7 +450,8 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     current_conn = bt_conn_ref(conn);
     dk_set_led_on(CON_STATUS_LED);
 
-    // Update the data length and MTU
+    // Update the connection parameters, data length and MTU
+    update_conn_params(conn);
     update_data_length(conn);
     update_mtu(conn);
 }
@@ -478,14 +469,20 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_conn_unref(current_conn);
     current_conn = NULL;
     dk_set_led_off(CON_STATUS_LED);
+}
 
-    /* 끊길 때 남은 누적 버퍼 폐기 */
-    g_acc_len = 0;
+/* 협상된 연결 파라미터 확인용(interval 단위: 1.25ms, timeout 단위: 10ms) */
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+                             uint16_t latency, uint16_t timeout) {
+    ARG_UNUSED(conn);
+    LOG_INF("Conn params: interval %u us, latency %u, timeout %u ms",
+            interval * 1250, latency, timeout * 10);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
     .connected = connected,
     .disconnected = disconnected,
+    .le_param_updated = le_param_updated,
 };
 
 void error(void) {
@@ -532,24 +529,18 @@ int main(void) {
     }
 }
 
-/* BLE 송신 전용 쓰레드: UART FIFO에서 읽어 HHS 파서 거쳐 누적 후 NUS 전송 */
+/* BLE 송신 전용 쓰레드: UART FIFO에서 읽어 HHS 파서 투입, 프레임 즉시 전송 */
 void ble_write_thread(void) {
     k_sem_take(&ble_init_ok, K_FOREVER);
 
     for (;;) {
         struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data, K_FOREVER);
 
-        /* 바이트 스트림을 HHS 파서에 투입 */
         for (uint16_t i = 0; i < buf->len; i++) {
             hhs_feed(buf->data[i], on_hhs_frame_cb);
         }
 
         k_free(buf);
-
-        /* 연결이 여유 있을 때 잔여 버퍼 플러시 */
-        if (g_acc_len && current_conn) {
-            nus_flush(g_acc, &g_acc_len);
-        }
     }
 }
 K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL,
