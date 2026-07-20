@@ -241,6 +241,21 @@ static const struct bt_data ad[] = {
 static const struct bt_data sd[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_HHS_VAL)};
 
+/* 광고 시작은 system workqueue에서 수행.
+ * disconnect 후 재시작 경로인 recycled 콜백은 ISR에 준하는 컨텍스트라
+ * BT API를 직접 호출하면 안 되기 때문(conn.h 주석 참고). */
+static void adv_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
+                              ARRAY_SIZE(sd));
+    if (err && err != -EALREADY) {
+        LOG_ERR("Advertising start err %d", err);
+        return;
+    }
+    LOG_INF("Advertising started");
+}
+static K_WORK_DEFINE(adv_work, adv_work_handler);
+
 #ifdef CONFIG_UART_ASYNC_ADAPTER
 UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
 #else
@@ -479,10 +494,15 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval,
             interval * 1250, latency, timeout * 10);
 }
 
+/* 연결 객체가 풀로 반환된 시점(disconnect 완료) → 광고 재시작.
+ * NCS v3.0/Zephyr 4.0부터는 광고가 자동 재개되지 않으므로 필수 */
+static void recycled(void) { k_work_submit(&adv_work); }
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
     .connected = connected,
     .disconnected = disconnected,
     .le_param_updated = le_param_updated,
+    .recycled = recycled,
 };
 
 void error(void) {
@@ -516,12 +536,7 @@ int main(void) {
     if (IS_ENABLED(CONFIG_SETTINGS))
         settings_load();
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
-                          ARRAY_SIZE(sd));
-    if (err) {
-        LOG_ERR("Advertising start err %d", err);
-        return 0;
-    }
+    k_work_submit(&adv_work);
 
     for (;;) {
         dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
