@@ -1,42 +1,254 @@
-# GMS_EEG Firmware
+# GMS_EEG 펌웨어
 
-This project contains the firmware for the GMS_EEG device. It is built using the nRF Connect SDK and Zephyr RTOS.
+nRF5340 기반 GMS 커스텀 보드용 펌웨어입니다. nRF Connect SDK V3.0.0(Zephyr RTOS)로 빌드합니다.
 
-## Overview
+UART로 들어오는 HHS 센서 데이터를 파싱해 **BLE 커스텀 GATT 서비스**로 중계하는 브리지 역할을 합니다.
 
-The primary function of this firmware is to act as a bridge between a UART-connected sensor and a Bluetooth Low Energy (BLE) central device.
+______________________________________________________________________
 
-It continuously listens on the UART interface for incoming byte streams. It then parses these streams to identify and assemble 17-byte data packets defined by the HHS protocol (identified by the `A5 5A 02` header).
+## 1. 동작 개요
 
-Once complete HHS packets are received, they are buffered and transmitted wirelessly over BLE using the Nordic UART Service (NUS). The firmware is optimized to batch multiple HHS packets together to make efficient use of the BLE connection's Maximum Transmission Unit (MTU).
+```text
+HHS 센서/AFE
+  → UART0 (115200bps)
+  → HHS 프레임 파서 (17바이트 조립)
+  → BLE 커스텀 GATT Notify (FFF1)
+  → 모바일/PC 수신 앱
+```
 
-## Key Technologies
+1. UART 스트림을 바이트 단위로 받아 상태머신으로 HHS 프레임을 조립합니다.
+1. 헤더 `A5 5A 02`를 찾고, 총 17바이트를 채웁니다.
+1. 마지막 바이트(Switches)가 유효하면 **프레임 완성 즉시 1건씩 notify**로 전송합니다.
 
-- **Framework:** [Zephyr RTOS](https://www.zephyrproject.org/)
-- **SDK:** [Nordic nRF Connect SDK](https://www.nordicsemi.com/Software-and-tools/Software/nRF-Connect-SDK)
-- **Wireless Protocol:** Bluetooth Low Energy (BLE)
-- **BLE Service:** Nordic UART Service (NUS)
+> **중요:** 이전 버전 문서에는 "Nordic UART Service(NUS)를 사용하고 여러 패킷을 묶어
+> MTU를 채워 보낸다"고 되어 있었으나, **현재 코드는 그렇지 않습니다.**
+> NUS 대신 커스텀 GATT 서비스를 쓰고, 배칭 없이 **1프레임 = 1 notification**으로 보냅니다.
+> 17바이트는 최소 ATT MTU(23) − 3 안에 항상 들어가므로 분할이 발생하지 않습니다.
 
-## Hardware
+______________________________________________________________________
 
-This firmware is designed to run on custom hardware based on the Nordic nRF5340 SoC. The specific board target is `gms/nrf5340/cpuapp`.
+## 2. HHS 프레임 형식
 
-## Building and Running
+| 위치 | 값 | 설명 |
+|---|---|---|
+| `[0]` | `0xA5` | 헤더 1 |
+| `[1]` | `0x5A` | 헤더 2 |
+| `[2]` | `0x02` | 버전 |
+| `[3]~[15]` | — | 페이로드 |
+| `[16]` | `0x04` 또는 `0x05` | Switches. `0x04` = 미착용, `0x05` = 착용 |
 
-This project is configured to be built with the standard Zephyr/nRF Connect SDK toolchain.
+- 전체 길이: **17바이트** (`HHS_PKT_SIZE`)
+- `[16]`이 `0x04`/`0x05`가 아니면 **프레임을 폐기**하고 `frame dropped: bad switches` 경고를 남깁니다.
+- 파서는 헤더 탐색 중 `0xA5`를 만나면 새 헤더 시작 후보로 보고 동기화를 유지합니다.
 
-1.  **Set up the nRF Connect SDK:** Follow the official Nordic Semiconductor documentation to install the toolchain and dependencies.
+프로토콜 상세 명세는 `doc/gms/HHS_protocol.docx`,
+보드 회로는 `doc/gms/GMS3300_HHS_REV.6_20241014.pdf`를 참고하십시오.
 
-2.  **Build the application:** Use the `west` command to build the firmware for the target board.
+______________________________________________________________________
 
-    ```sh
-    west build -b gms/nrf5340/cpuapp
-    ```
+## 3. BLE 인터페이스
 
-3.  **Flash the device:** Once the build is complete, flash the resulting firmware to the device.
+### 광고
 
-    ```sh
-    west flash
-    ```
+- 기기 이름: **`HHS_10001`** (`prj.conf`의 `CONFIG_BT_DEVICE_NAME`)
+- 스캔 응답에 서비스 UUID(FFF0)를 포함합니다.
+- 연결이 끊기면 `recycled` 콜백에서 광고를 재시작합니다.
+  NCS v3.0 / Zephyr 4.0부터는 광고가 자동 재개되지 않으므로 이 처리가 **필수**입니다.
 
-After flashing, the device will begin advertising as `GMS_EEG` (or as configured in `prj.conf`). You can connect to it using a BLE client that supports the NUS service to receive the HHS packet data.
+### 커스텀 GATT 서비스
+
+| 역할 | UUID | 속성 |
+|---|---|---|
+| 서비스 | `0000FFF0-0000-1000-8000-00805F9B34FB` | Primary Service |
+| 데이터 전송 | `0000FFF1-...` | Notify (+ CCC) |
+| 명령 수신 | `0000FFF2-...` | Write / Write Without Response |
+
+- 수신 앱은 **FFF1의 CCC를 활성화(구독)** 해야 데이터를 받습니다.
+- **FFF2(Write)는 현재 수신만 하고 아무 동작도 하지 않습니다.** 디버그 로그로만 출력합니다.
+  향후 명령 채널로 확장할 자리입니다.
+
+### 연결 파라미터
+
+연결 직후 다음을 요청합니다. 실제 적용 여부는 상대(central)가 결정합니다.
+
+| 항목 | 설정값 | 비고 |
+|---|---|---|
+| Connection Interval | 7.5 ~ 15 ms | Android는 대체로 수락, iOS는 15ms 수준 |
+| Slave Latency | 0 | |
+| Supervision Timeout | 4000 ms | |
+| Data Length (DLE) | 251 바이트 | 넷코어 설정과 맞춤 |
+| L2CAP MTU | 247 바이트 | |
+
+`BT_GAP_AUTO_UPDATE_CONN_PARAMS`의 5초 대기를 기다리지 않고 연결 즉시 협상을 시도합니다.
+거절되면 5초 뒤 스택의 auto-update가 같은 선호값으로 재시도합니다.
+
+______________________________________________________________________
+
+## 4. 하드웨어
+
+- **대상 보드:** `gms/nrf5340/cpuapp` (커스텀 보드, `boards/gms/`에 정의)
+- **MCU:** Nordic nRF5340 (앱 코어 + 네트워크 코어)
+
+### 핀맵
+
+| 기능 | 핀 | 비고 |
+|---|---|---|
+| UART0 TX | P1.02 | 115200 bps |
+| UART0 RX | P0.03 | |
+| LED0 | P0.18 | Active Low, 동작 표시(1초 점멸) |
+| Button 0 / 1 / 2 | P0.24 / P0.08 / P0.23 | Pull-up, Active Low |
+
+- NFC 전용 핀은 `CONFIG_NFCT_PINS_AS_GPIOS=y`로 **일반 GPIO로 전환**되어 있습니다.
+- UART0은 `app.overlay`에서 `nordic,nus-uart`로 지정되어 있습니다.
+  (심볼 이름은 NUS 샘플에서 유래했을 뿐, 실제로 NUS를 쓰지는 않습니다.)
+
+> **참고:** 코드는 연결 상태 표시용으로 `DK_LED2`를 사용하지만,
+> 이 보드에는 `led0` 별칭 하나만 정의되어 있어 **연결 표시 LED는 실제로 동작하지 않습니다.**
+> 동작 확인은 LED0 점멸과 RTT 로그로 하십시오.
+
+______________________________________________________________________
+
+## 5. 빌드 및 플래시
+
+### 필수 조건 — NCS v3.0.0 전용
+
+`CMakeLists.txt`에 버전 검사가 들어 있어, **다른 버전에서는 빌드가 즉시 실패**합니다.
+
+```cmake
+if(NOT NCS_VERSION VERSION_EQUAL "3.0.0")
+  message(FATAL_ERROR "이 프로젝트는 NCS v3.0.0 전용입니다. ...")
+```
+
+`nRF Connect SDK v3.0.0` 워크스페이스를 먼저 준비하십시오.
+
+### 빌드
+
+보드가 `CMakeLists.txt`에 이미 지정되어 있으므로 `-b` 옵션 없이 빌드됩니다.
+
+```bash
+west build
+```
+
+보드를 명시하려면 다음과 같이 합니다.
+
+```bash
+west build -b gms/nrf5340/cpuapp
+```
+
+처음부터 다시 빌드할 때는 pristine 옵션을 쓰십시오.
+
+```bash
+west build -p always
+```
+
+### 플래시
+
+```bash
+west flash
+```
+
+### 로그 확인
+
+로그는 **UART가 아니라 SEGGER RTT**로 나옵니다. UART0은 센서 데이터 경로라 로그와 공유하지 않습니다.
+
+```bash
+JLinkRTTViewer
+```
+
+______________________________________________________________________
+
+## 6. 주요 설정
+
+### `prj.conf` (앱 코어)
+
+| 설정 | 값 | 목적 |
+|---|---|---|
+| `CONFIG_BT_DEVICE_NAME` | `"HHS_10001"` | 광고 이름 |
+| `CONFIG_BT_NUS_UART_BUFFER_SIZE` | 128 | UART 수신 버퍼 크기 |
+| `CONFIG_BT_NUS_UART_RX_WAIT_TIME` | 1000 (µs) | RX 유휴 타임아웃. 짧게 잡아 수신 지연 제거 |
+| `CONFIG_BT_CONN_TX_MAX` | 10 | connection event당 다수 notify 전송 |
+| `CONFIG_BT_L2CAP_TX_BUF_COUNT` | 10 | 동일 |
+| `CONFIG_BT_ATT_TX_COUNT` | 10 | 동일 |
+| `CONFIG_BT_MAX_CONN` | 1 | 동시 연결 1개 |
+| `CONFIG_USE_SEGGER_RTT` | y | RTT 로그 백엔드 |
+
+### `sysbuild/ipc_radio.conf` (네트워크 코어)
+
+네트워크 코어 이미지는 sysbuild가 자동으로 함께 빌드합니다. 별도 소스는 필요 없습니다.
+
+| 설정 | 값 | 목적 |
+|---|---|---|
+| `CONFIG_BT_CTLR_DATA_LENGTH_MAX` | 251 | 앱 코어 DLE와 일치 |
+| `CONFIG_BT_CTLR_SDC_TX_PACKET_COUNT` | 10 | LL 송신 버퍼 증설 |
+| `CONFIG_BT_MAX_CONN` | 1 | 넷코어 RAM 절약 (기본 16 → 1) |
+| `CONFIG_SERIAL` / `CONFIG_LOG` | n | 넷코어 UART·로그 비활성 |
+
+> 앱 코어와 넷코어의 버퍼 설정은 **짝을 맞춰야** 합니다.
+> 한쪽만 바꾸면 DLE 협상이 기대대로 되지 않습니다.
+
+______________________________________________________________________
+
+## 7. 성능 설계 의도
+
+목표는 **초당 256 패킷** 스트리밍입니다.
+
+- 연결 간격 30ms 기준 이벤트당 약 8개 전송이 필요 → TX 큐를 10으로 증설
+- UART 콜백은 라인 종료 문자를 기준으로 끊지 않고, 수신분을 즉시 복사해 FIFO에 넣습니다.
+  드라이버 버퍼가 찰 때까지 기다리지 않으므로 패킷 지연이 없습니다.
+- notify가 `-ENOMEM`(TX 버퍼 고갈)을 반환하면 5ms 대기 후 재시도합니다.
+- 미연결·미구독 상태(`-ENOTCONN`)에서는 조용히 폐기합니다.
+
+### 스레드 구성
+
+| 스레드 | 역할 |
+|---|---|
+| `main` | 초기화 후 LED 1초 점멸만 수행 |
+| `ble_write_thread` | UART FIFO에서 읽어 파서에 투입, 프레임 완성 시 전송 (우선순위 7) |
+| system workqueue | 광고 시작, UART 재활성화 |
+
+> 광고 시작을 workqueue로 넘기는 이유는, `recycled` 콜백이 ISR에 준하는 컨텍스트라
+> BT API를 직접 호출하면 안 되기 때문입니다.
+
+______________________________________________________________________
+
+## 8. 알려진 사항 · 확인 필요
+
+- **FFF2 Write 특성은 미구현 상태**입니다. 로그만 남기고 동작하지 않습니다.
+- **연결 상태 LED(`DK_LED2`)는 이 보드에서 동작하지 않습니다** (LED가 1개뿐).
+- 초기화 실패 시 `error()`로 진입해 **LED를 모두 끄고 무한 대기**합니다. 자동 재부팅하지 않습니다.
+- 페어링/본딩 설정(`CONFIG_BT_SETTINGS=y`)은 켜져 있으나 보안 요구는 꺼져 있습니다
+  (`CONFIG_BT_NUS_SECURITY_ENABLED=n`). 암호화 없이 연결됩니다.
+- 실제 양산·현장 배포본과 이 소스의 커밋이 일치하는지는 **별도 확인이 필요**합니다.
+
+______________________________________________________________________
+
+## 9. 디렉터리 구조
+
+```text
+03_gms_eeg/
+├── src/main.c                 # 전체 로직 (파서 + GATT + UART)
+├── prj.conf                   # 앱 코어 설정
+├── prj_minimal.conf           # 최소 구성 (참고용)
+├── CMakeLists.txt             # 보드 지정 + NCS 버전 검사
+├── app.overlay                # nordic,nus-uart → uart0 지정
+├── sysbuild/ipc_radio.conf    # 네트워크 코어 설정
+├── boards/gms/                # 커스텀 보드 정의 (dts, defconfig 등)
+├── doc/gms/                   # HHS 프로토콜 명세, 회로도
+└── VERSION                    # 2.7.99
+```
+
+______________________________________________________________________
+
+## 10. 변경 이력
+
+| 커밋 | 날짜 | 내용 |
+|---|---|---|
+| `27cc3d9` | 2026-07-28 | NCS v3.0.0 버전 검사 추가 |
+| `d067507` | 2026-07-20 | 연결 해제 후 광고 재시작(`recycled`) |
+| `1d9791f` | 2026-07-20 | 패킷 처리 버그 수정 |
+| `d441640` | 2026-07-20 | 커스텀 GATT UUID 정리 |
+| `abe046c` | 2025-08-27 | README 최초 작성 (이번에 전면 개정) |
+| `c52b0aa` | 2025-08-26 | MTU 교환 및 연결 처리 리팩터링 |
+| `19b307d` | 2025-08-19 | GMS ↔ NUS 연동 확인 |
+
+관련 인수인계 문서: `../../00_인수인계/01_SW_핵심설명.md`
